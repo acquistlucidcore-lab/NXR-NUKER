@@ -1,15 +1,17 @@
 # nxr_nuker_protocol.py
-# NXR NUKER PROTOCOL v2.1
+# NXR NUKER PROTOCOL v2.2
 # Python 3.10+ | pip install aiohttp colorama pyyaml
 
 import asyncio
 import aiohttp
 import json
 import os
+import re
 import sys
 import time
 import random
 import traceback
+import unicodedata
 from pathlib import Path
 
 from colorama import init as cinit
@@ -137,7 +139,7 @@ def banner():
     for line in BANNER_ART:
         print(grad(line))
     sub = "N X R   N U K E R   P R O T O C O L"
-    tag = "[ v2.1 - full protocol ]"
+    tag = "[ v2.2 - full protocol ]"
     pad = " " * max(0, (len(BANNER_ART[0]) - len(sub)) // 2)
     print()
     print(pad + grad(sub))
@@ -164,53 +166,143 @@ def prompt(msg, default=None):
 
 
 def pause(msg="press ENTER to exit"):
-    """keep the window open — critical for double-clicked exe"""
     try:
         input(f"\n{C_MUTED}{msg}...{RESET}")
     except EOFError:
         pass
 
 
-def _normalize_token(raw):
+# ---------------------------------------------------------------
+# TOKEN / ID CLEANUP
+# ---------------------------------------------------------------
+def _clean(s):
+    """strip everything that isn't a printable ascii char, collapse whitespace"""
+    if s is None:
+        return ""
+    s = unicodedata.normalize("NFKC", s)
+    # replace curly quotes and similar lookalikes
+    s = s.replace("\u201c", "").replace("\u201d", "")
+    s = s.replace("\u2018", "").replace("\u2019", "")
+    s = s.replace("\u2013", "-").replace("\u2014", "-")
+    # kill BOM, zero-width, and any non-printable
+    s = "".join(ch for ch in s if ch.isprintable() or ch in " \t")
+    # collapse internal whitespace to nothing (tokens never contain spaces)
+    s = re.sub(r"\s+", "", s)
+    return s.strip().strip('"').strip("'")
+
+
+def _diagnose_token(raw):
     """
-    Accept any of:
-      - bot token with 'Bot ' prefix    -> unchanged
-      - bot token without prefix        -> prepend 'Bot '
-      - user token (JWT, two dots)      -> unchanged
-      - Bearer prefix                   -> normalized to 'Bot '
+    Look at the raw string and guess which common mistake it is.
+    Returns (cleaned_token, kind, hint).
+    kind in {bot, user, bad_id, bad_secret, bad_public_key, bad_short, bad_chars, empty}
     """
-    t = raw.strip().strip('"').strip("'")
-    low = t.lower()
-    if low.startswith("bot "):
+    s = _clean(raw)
+
+    if not s:
+        return s, "empty", "you didn't enter anything"
+
+    low = s.lower()
+    if low.startswith("bot"):
+        s = s[3:].lstrip()
+    elif low.startswith("bearer"):
+        s = s[6:].lstrip()
+
+    # client id / application id: pure digits, 17-20 long
+    if re.fullmatch(r"\d{17,20}", s):
+        return s, "bad_id", "that's the Application/Client ID, not the bot token"
+
+    # client secret: 32 chars, usually alnum
+    if re.fullmatch(r"[A-Za-z0-9_\-]{30,36}", s) and "." not in s:
+        return s, "bad_secret", "that looks like a Client Secret, not the bot token"
+
+    # public key: 64 hex chars
+    if re.fullmatch(r"[0-9a-fA-F]{64}", s):
+        return s, "bad_public_key", "that's the Public Key from General Information, not the token"
+
+    # user token: JWT with 2 dots
+    if s.count(".") == 2 and len(s) > 60 and not s.split(".")[0].startswith("M"):
+        # real user tokens start with M or N; JWT format is xxxx.yyyy.zzzz
+        pass
+
+    # bot token: exactly 2 dots, three base64-ish parts
+    if s.count(".") == 2:
+        parts = s.split(".")
+        # first part is base64 of the bot's user id
+        if len(parts[0]) >= 20 and len(parts[1]) >= 5 and len(parts[2]) >= 20:
+            return s, "bot", ""
+
+    if len(s) < 50:
+        return s, "bad_short", f"token is only {len(s)} chars — bot tokens are ~70+ chars"
+
+    return s, "bad_chars", "unrecognized token shape"
+
+
+def _mask(t):
+    if len(t) <= 12:
         return t
-    if low.startswith("bearer "):
-        return "Bot " + t.split(" ", 1)[1]
-    # JWT user token has exactly two dots and long segments
-    if t.count(".") == 2 and len(t) > 60:
-        return t
-    return "Bot " + t
+    return t[:6] + "..." + t[-4:]
 
 
 def _extract_guild_id(raw):
-    """accept raw snowflake, or paste a channel/message URL, or '<#id>'"""
-    s = raw.strip().strip("<>#")
-    # try to find a 17-20 digit snowflake
-    import re
+    s = _clean(raw).strip("<>#")
     digits = re.findall(r"\d{17,20}", s)
-    if digits:
-        return digits[0]
-    return s
+    return digits[0] if digits else s
+
+
+async def _probe_token(session, cleaned):
+    """
+    Try the token in every format Discord accepts.
+    Returns (working_auth_header, label, user_dict) or (None, None, last_error).
+    """
+    base = cleaned
+    low = base.lower()
+    if low.startswith("bot"):
+        base = base[3:].lstrip()
+    elif low.startswith("bearer"):
+        base = base[6:].lstrip()
+
+    attempts = [
+        ("Bot " + base,        "Bot <token>"),
+        (base,                 "raw <token>"),
+        ("Bearer " + base,     "Bearer <token>"),
+    ]
+
+    last_status = None
+    last_body = ""
+
+    for auth, label in attempts:
+        try:
+            headers = {
+                "Authorization": auth,
+                "User-Agent": UA,
+            }
+            async with session.get(f"{API}/users/@me", headers=headers) as r:
+                if r.status == 200:
+                    return auth, label, await r.json()
+                last_status = r.status
+                try:
+                    last_body = await r.text()
+                except Exception:
+                    last_body = ""
+                # 401 means format was wrong; try next variant
+                if r.status != 401:
+                    break
+        except Exception as e:
+            last_status = "exception"
+            last_body = f"{type(e).__name__}: {e}"
+
+    return None, None, {"status": last_status, "body": last_body}
 
 
 # ---------------------------------------------------------------
 # CORE
 # ---------------------------------------------------------------
 class NXRNuker:
-    def __init__(self, token, guild_id):
-        self.token = token.strip()
+    def __init__(self, auth_header, guild_id):
         self.guild_id = str(guild_id).strip()
         self.headers = {
-            "Authorization": self.token,
+            "Authorization": auth_header,
             "User-Agent": UA,
             "Content-Type": "application/json",
         }
@@ -254,9 +346,6 @@ class NXRNuker:
                 last_err = {"error": "exception", "text": f"{type(e).__name__}: {e}"}
                 await asyncio.sleep(1)
         return last_err
-
-    async def whoami(self):
-        return await self._req("GET", "/users/@me")
 
     async def fetch_guild(self):
         return await self._req("GET", f"/guilds/{self.guild_id}?with_counts=true")
@@ -784,29 +873,51 @@ async def run():
         log("ERR", "token and guild id required", C_ERR)
         return
 
-    token = _normalize_token(token_raw)
+    cleaned, kind, hint = _diagnose_token(token_raw)
     gid = _extract_guild_id(gid_raw)
+
+    print()
+    log("INPUT", f"token length: {len(cleaned)}  |  preview: {_mask(cleaned)}", C_MUTED)
+    log("INPUT", f"guild id: {gid}", C_MUTED)
+    print()
+
+    if kind == "empty":
+        log("ERR", "token is empty after cleanup", C_ERR)
+        return
+    if kind in ("bad_id", "bad_secret", "bad_public_key", "bad_short"):
+        log("ERR", hint, C_ERR)
+        log("HINT", "dev portal > Bot > Reset Token > Copy. paste THAT.", C_WARN)
+        return
 
     log("AUTH", "checking token...", C_WARN)
 
     try:
-        async with NXRNuker(token, gid) as n:
-            me = await n.whoami()
-            if "error" in me:
-                code = me.get("error")
-                if code == 401:
-                    log("ERR", "invalid token (401) — check the bot token", C_ERR)
-                else:
-                    log("ERR", f"auth failed: {code} {me.get('text','')[:120]}", C_ERR)
-                return
+        async with aiohttp.ClientSession() as probe:
+            auth, label, result = await _probe_token(probe, cleaned)
 
-            log("OK", f"logged in as {me.get('username','?')}#{me.get('discriminator','0')} (id {me.get('id','?')})", C_OK)
+        if not auth:
+            log("ERR", "invalid token (401) in every format tried", C_ERR)
+            status = result.get("status") if isinstance(result, dict) else None
+            body = (result.get("body") if isinstance(result, dict) else "") or ""
+            if status == 401:
+                log("DETAIL", "Discord said 401 Unauthorized for Bot/raw/Bearer formats.", C_MUTED)
+                log("CAUSE", "token string itself is wrong (revoked, mistyped, or not a bot token).", C_WARN)
+                log("HINT", "dev portal > your app > Bot > Reset Token > Copy. paste that whole string.", C_WARN)
+                log("HINT", "paste with CTRL+SHIFT+V in the terminal to avoid formatting.", C_WARN)
+                log("HINT", "the token should be ~70 chars, THREE parts separated by dots.", C_WARN)
+            else:
+                log("DETAIL", f"status {status}: {body[:200]}", C_MUTED)
+            return
 
+        log("AUTH", f"format accepted: {label}", C_OK)
+        log("OK", f"logged in as {result.get('username','?')}#{result.get('discriminator','0')} (id {result.get('id','?')})", C_OK)
+
+        async with NXRNuker(auth, gid) as n:
             info = await n.fetch_guild()
             if "error" in info:
                 code = info.get("error")
                 if code == 404:
-                    log("ERR", f"guild {gid} not found — bot is not in it or wrong id", C_ERR)
+                    log("ERR", f"guild {gid} not found — bot is not in it, or wrong id", C_ERR)
                 elif code == 403:
                     log("ERR", f"no access to guild {gid} (403) — invite the bot first", C_ERR)
                 else:
