@@ -1,0 +1,38 @@
+# NXR NUKER PROTOCOL — runtime config
+# all values here are loaded at startup.
+
+nuker:
+  reason: "NXR"
+  concurrency: 6
+  fetch_member_limit: 1000
+  ban_delete_days: 1
+
+  guild_rename: "NXR NUKED"
+
+  spam_channel_name: "nxr"
+  spam_channel_amount: 50
+  spam_channel_type: 0
+  spam_channel_concurrency: 3
+
+  spam_role_name: "nxr"
+  spam_role_amount: 50
+  spam_role_color: 0
+
+  spam_message_content: "@everyone NXR"
+  spam_message_amount: 10
+  spam_message_delay: 0.0
+
+  fullnuke_channel_spam_name: "nxr-wiped"
+  fullnuke_channel_spam_amount: 20
+  fullnuke_role_spam_name: "nxr"
+  fullnuke_role_spam_amount: 20
+
+ui:
+  gradient_start: [255, 45, 45]
+  gradient_end:   [165, 0, 255]
+  accent:  [255, 60, 90]
+  success: [90, 240, 150]
+  warn:    [255, 200, 60]
+  error:   [255, 70, 70]
+  muted:   [120, 120, 130]
+  truecolor: true
