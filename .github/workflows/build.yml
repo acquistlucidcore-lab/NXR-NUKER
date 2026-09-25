@@ -27,24 +27,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build exe
-        run: |
-          pyinstaller --onefile --console --name NXR_NUKER_PROTOCOL ^
-            --exclude-module tkinter ^
-            --exclude-module PyQt5 ^
-            --exclude-module PySide2 ^
-            --exclude-module numpy ^
-            --exclude-module pandas ^
-            --exclude-module scipy ^
-            --exclude-module matplotlib ^
-            --exclude-module PIL ^
-            --exclude-module pytest ^
-            --exclude-module setuptools ^
-            --exclude-module pip ^
-            --exclude-module wheel ^
-            --exclude-module pydoc ^
-            --exclude-module doctest ^
-            --exclude-module unittest ^
-            nxr_nuker_protocol.py
+        run: pyinstaller --onefile --console --name NXR_NUKER_PROTOCOL --exclude-module tkinter --exclude-module PyQt5 --exclude-module PySide2 --exclude-module numpy --exclude-module pandas --exclude-module scipy --exclude-module matplotlib --exclude-module PIL --exclude-module pytest --exclude-module setuptools --exclude-module pip --exclude-module wheel --exclude-module pydoc --exclude-module doctest --exclude-module unittest nxr_nuker_protocol.py
 
       - name: Show dist
         run: dir dist
